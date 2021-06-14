@@ -1,0 +1,405 @@
+#!/usr/bin/env python
+
+# Design sketch board
+#
+# mac server --max-nodes 30 --project-id moeyens-thor-dev --zone us-west1-a --machine-type e2-standard-2	# start the autoscaler where rmq runs
+# mac worker 127.0.0.1:5432 amqp://localhost thor								# start the worker, connect to rabbitmq at 127.0.0.1:5432, user mjuric
+# mac submit thor -- ... cmdline to execute ...									# submit the command to run (assume user $USER)
+#
+# Debugging cheat sheet
+#
+#  sudo rabbitmqctl list_queues
+#
+
+import pika, sys, time, json, threading, datetime, os, socket, psutil
+
+def queue_name(user, cluster, purpose):
+    return f"mac.{user}.{cluster}.{purpose}"
+
+class Scaler:
+    project_id = None
+    zone = None
+    cluster = None
+    user = None
+    machine_type = 'e2-standard-2'
+    min_nodes = 0
+    max_nodes = 10
+    
+    max_idle = 30
+    node_startup_time = 120
+
+    # RabbitMQ queue names, constructed from the cluster name
+    _tasks_queue = None
+    _status_queue = None
+
+    def __init__(self, project_id, zone, cluster, user, machine_type=None, min_nodes=None, max_nodes=None):
+        self.project_id = project_id
+        self.zone = zone
+        self.cluster = cluster
+        self.user = user
+
+        self.machine_type = machine_type if machine_type is not None else Scaler.machine_type
+        self.min_nodes    = min_nodes    if min_nodes    is not None else Scaler.min_nodes
+        self.max_nodes    = max_nodes    if max_nodes    is not None else Scaler.max_nodes
+
+        self._tasks_queue  = queue_name(user, cluster, "tasks")
+        self._status_queue = queue_name(user, cluster, "status")
+
+    #
+    # node list/create/delete routines
+    #
+    def get_nodes(self):
+        import google.cloud.compute_v1 as compute_v1
+
+        # Get all running nodes for this cluster
+        instance_client = compute_v1.InstancesClient()
+        request = compute_v1.ListInstancesRequest(filter=f"(labels.mac-name = {self.cluster}) AND (status = running)", project=self.project_id, zone=self.zone)
+        instance_list = instance_client.list(request=request)
+        return list(instance_list)
+
+    def create_nodes(self, count):
+        import google.cloud.compute_v1 as compute_v1
+
+        # launch a set of nodes
+        zone = self.zone
+        machine_type = self.machine_type
+        name_pattern = f'mac-{self.cluster}-######'
+        network_name = 'global/networks/default'
+        project_id = 'moeyens-thor-dev'
+
+        # Launch count new nodes
+        print(f"Launching {count} nodes")
+
+        instance_client = compute_v1.InstancesClient()
+
+        # Every machine requires at least one persistent disk
+        disk = compute_v1.AttachedDisk()
+        initialize_params = compute_v1.AttachedDiskInitializeParams()
+        initialize_params.source_image = "projects/moeyens-thor-dev/global/images/ray-thin"
+        initialize_params.disk_size_gb = "10"
+        disk.initialize_params = initialize_params
+        disk.auto_delete = True
+        disk.boot = True
+        disk.type_ = compute_v1.AttachedDisk.Type.PERSISTENT
+
+        # Every machine needs to be connected to a VPC network.
+        # The 'default' network is created automatically in every project.
+        network_interface = compute_v1.NetworkInterface()
+        network_interface.name = network_name
+
+        # Scheduling
+        scheduling = compute_v1.Scheduling()
+        scheduling.preemptible = True
+
+        # Collecting all the information into the Instance object
+        instance = compute_v1.InstanceProperties()
+        instance.scheduling = scheduling
+        instance.disks = [disk]
+        instance.machine_type = machine_type
+        instance.network_interfaces = [network_interface]
+        instance.labels = { 'mac-name': cluster }
+
+        # collect all these into a BulkInsertInstanceResource, and specify how many
+        # instances to create
+        bi = compute_v1.BulkInsertInstanceResource()
+        bi.count = str(count)
+        bi.instance_properties = instance
+        bi.name_pattern = name_pattern
+
+        # Preparing the InsertInstanceRequest
+        request = compute_v1.BulkInsertInstanceRequest()
+        request.zone = zone
+        request.project = project_id
+        request.bulk_insert_instance_resource_resource = bi
+
+        print(f"Creating {count} instances in {zone}...")
+    #    print(request)
+
+        operation = instance_client.bulk_insert(request=request)
+        if operation.status == compute_v1.Operation.Status.RUNNING:
+            operation_client = compute_v1.ZoneOperationsClient()
+            operation = operation_client.wait(
+                operation=operation.name, zone=zone, project=project_id
+            )
+        if operation.error:
+            print("Error during creation:", operation.error, file=sys.stderr)
+        if operation.warnings:
+            print("Warning during creation:", operation.warnings, file=sys.stderr)
+        print(f"Bulk create of {count} instances succeeded.")
+
+    def delete_nodes(self, nodes):
+        import google.cloud.compute_v1 as compute_v1
+
+        # delete a list of nodes
+        print(f"Deleting {nodes}...")
+
+        instance_client = compute_v1.InstancesClient()
+        ops = []
+        for node in nodes:
+            operation = instance_client.delete(project=self.project_id, zone=self.zone, instance=node)
+            ops.append(operation)
+            if operation.error:
+                print("Error during deletion:", operation.error, file=sys.stderr)
+            if operation.warnings:
+                print("Warning during deletion:", operation.warnings, file=sys.stderr)
+
+        # wait for completion of all deletions
+        operation_client = compute_v1.ZoneOperationsClient()
+        for operation in ops:
+            operation = operation_client.wait(operation=operation.name, zone=self.zone, project=self.project_id)
+            if operation.error:
+                print("Error during deletion:", operation.error, file=sys.stderr)
+            if operation.warnings:
+                print("Warning during deletion:", operation.warnings, file=sys.stderr)
+
+        print(f"Instances {nodes} deleted.")
+
+    #
+    # autoscaler thread routines
+    #
+
+    status_recv_thread = None
+    def monitor(self):
+        cluster = self.cluster
+
+        # start the status receiver thread
+        if self.status_recv_thread is None:
+            self.status_recv_thread = threading.Thread(target=self._status_receiver, daemon=True)
+            self.status_recv_thread.start()
+
+        con = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+        try:
+            channel = con.channel()
+
+            while True:
+                now = time.time()
+
+                #
+                # Gather information about the cluster and the queue
+                #
+                nodes = self.get_nodes()
+                nnodes = len(nodes)
+
+                queue = channel.queue_declare(queue=self._tasks_queue, durable=True, exclusive=False, auto_delete=False)
+                ntasks = queue.method.message_count
+
+                nplus = min(max(ntasks - nnodes, self.min_nodes), self.max_nodes)
+
+                print(f"{now=}: {nnodes=} {ntasks=} {nplus=}")
+
+                #
+                # Should we scale up?
+                #
+                if nplus > 0:
+                    print(f"{nplus=}")
+#                    new_nodes = self.create_nodes(cluster=cluster, count=nplus)
+
+                #
+                # Should we scale down?
+                #
+                self._check_scaledown(nodes)
+
+                # sleep a bit so we don't hit Google's API server too hard
+                dt = max(0, 10 - (time.time() - now))
+                time.sleep(dt)
+        finally:
+            con.close()
+            # FIXME: implement a way to gracefully exit the status receiver thread
+            # status_recv_thread.kill()
+
+    _last_busy = {}
+    def _check_scaledown(self, nodes):
+        # see which nodes we haven't heard from in awhile, and delete them if
+        # they're idle for too long
+        now = time.time()
+        delete_list = []
+
+        print("-----------")
+        for node in nodes:
+            ip = node.network_interfaces[0].network_i_p
+            creation_time = time.mktime(datetime.datetime.strptime(node.creation_timestamp, "%Y-%m-%dT%H:%M:%S.%f%z").timetuple())
+
+            try:
+                lb = self.last_busy[ip]
+            except KeyError:
+                # this could happen if the node hasn't checked in yet (either
+                # because it's so new, or we've restarte the autoscaler). Then
+                # play it safe and assume it's been busy recently
+                lb = self.last_busy[ip] = now
+
+            # if this is a newly created node, set its "last busy" time into
+            # the future to give it some time to initialize
+            lb = max(lb, creation_time + 120)
+
+            age = now - lb
+            if age > self.max_idle:
+                delete_list.append(node.name)
+
+            print(f"{node.name:20s} {age=} (deletion in {timeout - age} seconds)")
+
+        # if min_nodes is set, keep some nodes runing (and pick the ones
+        # with the lowest serial number, to keep things neat).
+        delete_list = sorted(delete_list)[self.min_nodes:]
+
+        # Now delete any nodes that have been idle for too long
+        if delete_list:
+            print(f"Would delete {delete_list}")
+#            self.delete_nodes(delete_list)
+
+    def _status_receiver(self):
+        # receive status messages from nodes
+        cluster = self.cluster
+        con = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+        try:
+            def callback(ch, method, properties, body):
+                # decode and print the status message
+                ip, task_uuid, ram, cpu = json.loads(body)
+                print(f"({ip=}, {task_uuid=})   {ram=}, {cpu=}")
+
+                # record that this node is busy
+                if task_uuid is not None:
+                    self.last_busy[ip] = time.time()
+
+                # acknowledge delivery
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+
+            channel = con.channel()
+            queue = channel.queue_declare(queue=self._status_queue, durable=True)
+            channel.basic_consume(queue=self._status_queue, on_message_callback=callback)
+            channel.start_consuming()
+        finally:
+            con.close()
+
+    @classmethod
+    def run(cls, args):
+        scaler = cls(args.project_id, args.zone, args.cluster, args.user, args.machine_type, args.min_nodes, args.max_nodes)
+        try:
+            scaler.monitor()
+        except KeyboardInterrupt: # catch CTRL-C
+            pass
+
+    @classmethod
+    def register_command(cls, parent_parser):
+        # create a parser for the autoscaler
+        parser = parent_parser.add_parser('autoscaler', help='Start the mac autoscaler (run on the head node)', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        parser.set_defaults(run=cls.run)
+
+        # mac server --max-nodes 30 --project-id moeyens-thor-dev --zone us-west1-a --machine-type e2-standard-2	# start the autoscaler
+        parser.add_argument('cluster', type=str, help='Unique cluster name (e.g., mjuric-thor)')
+        parser.add_argument('project_id', type=str, help='Google project ID (e.g., moeyens-thor-dev)')
+        parser.add_argument('zone', type=str, help='Zone in which to create the resources (e.g., us-west1-a)')
+        parser.add_argument('--user', type=str, default=os.getlogin(), help='Username under which the workers will run')
+        parser.add_argument('--min-nodes', type=int, default=cls.min_nodes, help='Minimum number of nodes to keep up')
+        parser.add_argument('--max-nodes', type=int, default=cls.max_nodes, help='Maximum number of nodes to scale to')
+        parser.add_argument('--machine-type', type=str, default=cls.machine_type, help='Machine type')
+
+        return parser
+
+class Worker:
+    task_uuid = None
+    cmdline = None
+
+    def _status_reporter(self):
+        # status reporter thread
+        #connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+        connection = pika.BlockingConnection(self._con_params)
+        channel = connection.channel()
+
+        channel.queue_declare(queue=self._status_queue, durable=True)
+
+        ip = socket.gethostbyname(socket.gethostname())
+
+        try:
+            while True:
+                ram, cpu = psutil.virtual_memory().percent, psutil.cpu_percent()
+                message = json.dumps([ip, self.task_uuid, ram, cpu])
+
+                channel.basic_publish(
+                    exchange='',
+                    routing_key=self._status_queue,
+                    body=message,
+                    properties=pika.BasicProperties(
+                        delivery_mode=2,  # make message persistent
+                    ))
+                print(f"{ip=}, {self.task_uuid=}, {ram=}, {cpu=}, {self.cmdline=}")
+                time.sleep(5)
+        finally:
+            connection.close()
+
+    _status_reporter_thread = None
+    def consume_tasks(self):
+        # task receiver thread
+        cluster = self.cluster
+
+        # start the status reporter thread
+        if self._status_reporter_thread is None:
+            self._status_reporter_thread = threading.Thread(target=self._status_reporter, daemon=True)
+            self._status_reporter_thread.start()
+
+        def _executor(ch, method, properties, body):
+            # execute the received task
+            self.task_uuid, self.cmdline = json.loads(body)
+
+            #... execute task ...
+            print(self.cmdline)
+            time.sleep(50)
+            
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            self.task_uuid = self.cmdline = None
+
+        # connect to the worker queue
+        #connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+        connection = pika.BlockingConnection(self._con_params)
+        channel = connection.channel()
+        channel.queue_declare(queue=self._tasks_queue, durable=True)
+        channel.basic_qos(prefetch_count=1)
+        channel.basic_consume(queue=self._tasks_queue, on_message_callback=_executor)
+        channel.start_consuming()
+
+    cluster = None
+    user = None
+    def __init__(self, url, cluster, user):
+        self.url = url
+        self.cluster = cluster
+        self.user = user
+
+        self._con_params = pika.URLParameters(url)
+
+        self._tasks_queue  = queue_name(user, cluster, "tasks")
+        self._status_queue = queue_name(user, cluster, "status")
+
+    @classmethod
+    def run(cls, args):
+        worker = cls(args.url, args.cluster, args.user)
+        try:
+            worker.consume_tasks()
+        except KeyboardInterrupt: # catch CTRL-C
+            pass
+
+    @classmethod
+    def register_command(cls, parent_parser):
+        # create a parser for the autoscaler
+        parser = parent_parser.add_parser('worker', help='Start the worker daemon (run on the worker nodes)', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        parser.set_defaults(run=cls.run)
+
+        # mac worker 127.0.0.1:5432 thor
+        parser.add_argument('url', type=str, help='AMQP URL to the head node (e.g. amqp://localhost:5672)')
+        parser.add_argument('cluster', type=str, help='Unique cluster name (e.g., mjuric-thor)')
+        parser.add_argument('--user', type=str, default=os.getlogin(), help='Username under which to run the tasks')
+
+        return parser
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='mac: the autoscaling cloud batch queuing system made out of "chicken wire & sh*t" (Smith, K., Mallrats, 1995)')
+    # mac server --max-nodes 30 --project-id moeyens-thor-dev --zone us-west1-a --machine-type e2-standard-2	# start the autoscaler
+
+    subparsers = parser.add_subparsers(help='sub-command help')
+    Scaler.register_command(subparsers)
+    Worker.register_command(subparsers)
+
+    # parse some argument lists
+    args = parser.parse_args()
+    args.run(args)
+
